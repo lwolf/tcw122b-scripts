@@ -85,23 +85,25 @@ PIR_STATES = {
 def write_state(list_of_uid_and_values):
     # to every write we should also send WRITE_CONFIRM
     list_of_uid_and_values.append((WRITE_CONFIRM, rfc1902.Integer(1)))
-    cmdGen = cmdgen.CommandGenerator()
-    errorIndication, errorStatus, errorIndex, varBinds = cmdGen.setCmd(
+    cmd_gen = cmdgen.CommandGenerator()
+    error_indication, error_status, error_index, binds = cmd_gen.getCmd(
         cmdgen.CommunityData('private'),
         cmdgen.UdpTransportTarget((DEVICE_HOST, 161)),
         *list_of_uid_and_values
     )
-    if errorIndication:
-        print(errorIndication)
+    # Check for errors and print out results
+    if error_indication:
+        print(error_indication)
+        return
     else:
-        if errorStatus:
+        if error_status:
             print('%s at %s' % (
-                errorStatus.prettyPrint(),
-                errorIndex and varBinds[int(errorIndex)-1] or '?'
+                error_status.prettyPrint(),
+                error_index and binds[int(error_index) - 1] or '?'
                 )
             )
         else:
-            for name, val in varBinds:
+            for name, val in binds:
                 print('%s = %s' % (name.prettyPrint(), val.prettyPrint()))
 
 
