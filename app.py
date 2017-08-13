@@ -1,7 +1,7 @@
 # TCW122B-CM
 import datetime
 import time
-
+import logging
 import asyncio
 import requests
 from pysnmp.entity import config
@@ -10,6 +10,8 @@ from pysnmp.carrier.asyncio.dgram import udp
 from pysnmp.entity.rfc3413.ntfrcv import NotificationReceiver
 from pysnmp.entity.rfc3413.oneliner import cmdgen
 from pysnmp.proto import rfc1902
+
+log = logging.getLogger(__name__)
 
 NAMESPACE = '1.3.6.1.4.1.38783'
 WRITE_CONFIRM = '1.3.6.1.4.1.38783.3.13.0'
@@ -60,7 +62,7 @@ DEBUG_VALUES = {
 SETTINGS = {
     RELAY1_ID: {'from': 0, 'to': 0},
     RELAY2_ID: {'from': 0, 'to': 0},
-    'timeout': 20,
+    'timeout': 15,
 }
 
 PIR_STATES = {
@@ -93,17 +95,17 @@ def write_state(list_of_uid_and_values):
         *list_of_uid_and_values
     )
     if errorIndication:
-        print(errorIndication)
+        log.info(errorIndication)
     else:
         if errorStatus:
-            print('%s at %s' % (
+            log.info('%s at %s' % (
                 errorStatus.prettyPrint(),
                 errorIndex and varBinds[int(errorIndex)-1] or '?'
                 )
             )
         else:
             for name, val in varBinds:
-                print('%s = %s' % (name.prettyPrint(), val.prettyPrint()))
+                log.info('%s = %s' % (name.prettyPrint(), val.prettyPrint()))
 
 
 def read_state(uids):
@@ -116,11 +118,11 @@ def read_state(uids):
 
     # Check for errors and print out results
     if error_indication:
-        print(error_indication)
+        log.info(error_indication)
         return
     else:
         if error_status:
-            print('%s at %s' % (
+            log.info('%s at %s' % (
                 error_status.prettyPrint(),
                 error_index and binds[int(error_index) - 1] or '?'
                 )
@@ -130,7 +132,7 @@ def read_state(uids):
 
 
 def update_config():
-    print("get initial configuration")
+    log.info("get initial configuration")
     results = read_state([PIR1_MODE, PIR2_MODE])
 
     PIR_STATES[PIR1_STATE]['manual_mode'] = int(results[PIR1_MODE]) == MANUAL
@@ -145,7 +147,7 @@ def config_updater(loop):
 
 
 def check_schedule():
-    print("check schedule")
+    log.info("check schedule")
     results = read_state([
         PIR_TIMEOUT, R1_WORK_FROM, R1_WORK_TO, R2_WORK_FROM, R2_WORK_TO]
     )
@@ -162,11 +164,11 @@ def lights_switcher(loop):
     now = time.time()
     for name, state in PIR_STATES.items():
         if state['state'] == 1 and state['ts'] != 0 and now - state['ts'] > SETTINGS['timeout']:
+            log.info("%s: WE SHOULD TURN %s OFF now" % (time.time(), state['relay']))
+            write_state([(state['relay_id'], rfc1902.Integer(0))])
             state['state'] = 0
             state['ts'] = 0
-            print("%s: WE SHOULD TURN %s OFF now" % (time.time(), state['relay']))
-            write_state([(state['relay_id'], rfc1902.Integer(0))])
-    # print("nothing happened", time.time())
+    # log.info("nothing happened", time.time())
 
     loop.call_later(1, lights_switcher, loop)
 
@@ -199,21 +201,23 @@ def callback(engine, state_reference, ctx_engine_id, ctx_name, binds, cbCtx):
     str_name = str(name)
     if str_name in PIR_STATES:
         content = PIR_STATES[str_name]
-        if content['manual_mode'] and is_valid_timeframe(content):
-            if content['state'] == 1:
-                print("%s: %s should be %s now" % (time.time(), content['relay'], val))
+        if not content['manual_mode'] or not is_valid_timeframe(content):
+            return
+        if content['state'] == 1:
+            log.info("%s: %s should be %s now" % (time.time(), content['relay'], val))
+            content['ts'] = 0
 
-                if int(val) == 0:
-                    content['ts'] = time.time()
+        if int(val) == 0:
+            content['ts'] = time.time()
 
-            if int(val) == 1 and content['state'] != 1:
-                write_state([(content['relay_id'], rfc1902.Integer(1))])
-                content['state'] = 1
+        if int(val) == 1 and content['state'] != 1:
+            write_state([(content['relay_id'], rfc1902.Integer(1))])
+            content['state'] = 1
 
     elif str_name == CONFIGURATION_SAVED:
-        print("Looks like config has been changed...updating.")
+        log.info("Looks like config has been changed...updating.")
         update_config()
-    print('~~~~>', DEBUG_VALUES.get(str(name), str(name))," new value: ", str(val))
+    log.info('~~~~>', DEBUG_VALUES.get(str(name), str(name))," new value: ", str(val))
 
 
 def configure_engine(engine, host='127.0.0.1', port=162):
@@ -240,6 +244,6 @@ if __name__ == '__main__':
     try:
         loop.run_forever()
     except KeyboardInterrupt:
-        print("Turning off..")
+        log.info("Turning off..")
         loop.close()
         receiver.close(engine)
