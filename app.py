@@ -1,9 +1,11 @@
 # TCW122B-CM
-import datetime
-import time
-import logging
 import asyncio
-import requests
+import datetime
+import logging
+import os
+import sys
+import time
+
 from pysnmp.entity import config
 from pysnmp.entity.engine import SnmpEngine
 from pysnmp.carrier.asyncio.dgram import udp
@@ -11,7 +13,8 @@ from pysnmp.entity.rfc3413.ntfrcv import NotificationReceiver
 from pysnmp.entity.rfc3413.oneliner import cmdgen
 from pysnmp.proto import rfc1902
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("lights_control")
+
 
 NAMESPACE = '1.3.6.1.4.1.38783'
 WRITE_CONFIRM = '1.3.6.1.4.1.38783.3.13.0'
@@ -88,23 +91,24 @@ PIR_STATES = {
 def write_state(list_of_uid_and_values):
     # to every write we should also send WRITE_CONFIRM
     list_of_uid_and_values.append((WRITE_CONFIRM, rfc1902.Integer(1)))
-    cmdGen = cmdgen.CommandGenerator()
-    errorIndication, errorStatus, errorIndex, varBinds = cmdGen.setCmd(
+    cmd_gen = cmdgen.CommandGenerator()
+    error_indication, error_status, error_index, binds = cmd_gen.setCmd(
         cmdgen.CommunityData('private'),
         cmdgen.UdpTransportTarget((DEVICE_HOST, 161)),
         *list_of_uid_and_values
     )
-    if errorIndication:
-        log.info(errorIndication)
+    if error_indication:
+        log.info("Error indication: ", error_indication)
+        raise ValueError
     else:
-        if errorStatus:
+        if error_status:
             log.info('%s at %s' % (
-                errorStatus.prettyPrint(),
-                errorIndex and varBinds[int(errorIndex)-1] or '?'
+                error_status.prettyPrint(),
+                error_index and binds[int(error_index)-1] or '?'
                 )
             )
         else:
-            for name, val in varBinds:
+            for name, val in binds:
                 log.info('%s = %s' % (name.prettyPrint(), val.prettyPrint()))
 
 
@@ -118,8 +122,8 @@ def read_state(uids):
 
     # Check for errors and print out results
     if error_indication:
-        log.info(error_indication)
-        return
+        log.info("Error indication: ", error_indication)
+        raise ValueError
     else:
         if error_status:
             log.info('%s at %s' % (
@@ -137,13 +141,15 @@ def update_config():
 
     PIR_STATES[PIR1_STATE]['manual_mode'] = int(results[PIR1_MODE]) == MANUAL
     PIR_STATES[PIR2_STATE]['manual_mode'] = int(results[PIR2_MODE]) == MANUAL
+    log.info("PIR1 is on MANUAL: %s" % PIR_STATES[PIR1_STATE]['manual_mode'])
+    log.info("PIR2 is on MANUAL: %s" % PIR_STATES[PIR2_STATE]['manual_mode'])
 
 
 def config_updater(loop):
     loop.call_soon(update_config)
     loop.call_soon(check_schedule)
     # resync config every 15 minutes
-    loop.call_later(60 * 15, config_updater, loop)
+    loop.call_later(60 * 5, config_updater, loop)
 
 
 def check_schedule():
@@ -153,11 +159,21 @@ def check_schedule():
     )
 
     SETTINGS['timeout'] = int(results[PIR_TIMEOUT])
+    log.info("Timeout is set to %s seconds" % SETTINGS['timeout'])
+
     SETTINGS[RELAY1_ID]['from'] = int(results[R1_WORK_FROM]) / 10
     SETTINGS[RELAY1_ID]['to'] = int(results[R1_WORK_TO]) / 10
+    log.info("RELAY1 schedule: %s to %s" % (
+        SETTINGS[RELAY1_ID]['from'],
+        SETTINGS[RELAY1_ID]['to'])
+     )
 
     SETTINGS[RELAY2_ID]['from'] = int(results[R2_WORK_FROM]) / 10
     SETTINGS[RELAY2_ID]['to'] = int(results[R2_WORK_TO]) / 10
+    log.info("RELAY2 schedule: %s to %s" % (
+        SETTINGS[RELAY2_ID]['from'],
+        SETTINGS[RELAY2_ID]['to'])
+     )
 
 
 def lights_switcher(loop):
@@ -213,10 +229,10 @@ def callback(engine, state_reference, ctx_engine_id, ctx_name, binds, cbCtx):
         if int(val) == 1 and content['state'] != 1:
             write_state([(content['relay_id'], rfc1902.Integer(1))])
             content['state'] = 1
-
     elif str_name == CONFIGURATION_SAVED:
         log.info("Looks like config has been changed...updating.")
         update_config()
+    log.info("NEW EVENT: ", str_name)
     log.info('~~~~>', DEBUG_VALUES.get(str(name), str(name))," new value: ", str(val))
 
 
@@ -232,10 +248,20 @@ def configure_engine(engine, host='127.0.0.1', port=162):
 
 
 if __name__ == '__main__':
+    lvl = os.environ.get("LOG_LEVEL", "")
+    device = os.environ['DEVICE_ADDRESS']
+    log_level = "DEBUG" if lvl.upper() == "DEBUG" else "INFO"
+
+    logging.basicConfig(
+        stream=sys.stdout,
+        level=log_level,
+        format='%(asctime)s %(levelname)s:%(name)s:%(message)s'
+    )
+
     loop = asyncio.get_event_loop()
     engine = SnmpEngine()
 
-    configure_engine(engine, '172.44.0.100')
+    configure_engine(engine, device)
     receiver = NotificationReceiver(engine, callback)
 
     loop.call_soon(config_updater, loop)
