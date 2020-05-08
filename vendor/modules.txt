@@ -1,0 +1,10 @@
+# github.com/VictoriaMetrics/metrics v1.11.2
+## explicit
+github.com/VictoriaMetrics/metrics
+# github.com/soniah/gosnmp v1.25.0
+## explicit
+github.com/soniah/gosnmp
+# github.com/valyala/fastrand v1.0.0
+github.com/valyala/fastrand
+# github.com/valyala/histogram v1.0.1
+github.com/valyala/histogram
