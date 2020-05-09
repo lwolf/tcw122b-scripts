@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/metrics"
+	"github.com/jonboulle/clockwork"
 	"github.com/soniah/gosnmp"
 )
 
@@ -25,6 +26,11 @@ var (
 	// SNMP call duration
 	requestDuration = metrics.NewSummary(`requests_duration_seconds`)
 )
+
+type snmpGetterSetter interface {
+	Get([]string) (*gosnmp.SnmpPacket, error)
+	Set([]gosnmp.SnmpPDU) (*gosnmp.SnmpPacket, error)
+}
 
 const (
 	stateOff state = 0
@@ -46,19 +52,36 @@ const (
 )
 
 type app struct {
-	snmp *gosnmp.GoSNMP
+	snmp  snmpGetterSetter
+	clock clockwork.Clock
 
-	pir1 *pir
-	pir2 *pir
+	pirs       map[string]*pir
+	timeoutOid string
+}
+
+func (a *app) Print() {
+	fmt.Printf("************************\n")
+	for pirName, pir := range a.pirs {
+		fmt.Printf("pir=%s: %+v\n", pirName, pir)
+	}
+	fmt.Printf("************************\n")
+}
+
+func (a *app) pirByName(name string) *pir {
+	return a.pirs[name]
+}
+
+func (a *app) collectOids() (oids []string) {
+	oids = append(oids, a.timeoutOid)
+	for _, pir := range a.pirs {
+		oids = append(oids, pir.stateOid, pir.modeOid, pir.switchOid, pir.scheduleFromOid, pir.scheduleToOid)
+	}
+	return
 }
 
 func (a *app) setAppState() error {
-	oids := []string{
-		pir1State, pir1Mode, relay1Id, relay1WorkFrom, relay1WorkTo,
-		pir2State, pir2Mode, relay2Id, relay2WorkFrom, relay2WorkTo,
-		pirTimeout,
-	}
-	start := time.Now()
+	oids := a.collectOids()
+	start := a.clock.Now()
 	requestsTotal.Inc()
 	result, err := a.snmp.Get(oids) // Get() accepts up to g.MAX_OIDS
 	if err != nil {
@@ -73,12 +96,16 @@ func (a *app) setAppState() error {
 	if len(values) != len(oids) {
 		return fmt.Errorf("not all values were received: expected %d, got %d\n", len(oids), len(values))
 	}
-	timeout := time.Duration(values[pirTimeout]) * time.Second
-	a.pir1.timeout = timeout
-	a.pir1.schedule.UpdateState(values)
-	a.pir2.timeout = timeout
-	a.pir2.schedule.UpdateState(values)
-	return nil
+	timeout := time.Duration(values[a.timeoutOid]) * time.Second
+	for _, pir := range a.pirs {
+		pir.timeout = timeout
+		pir.UpdateSchedule(values)
+		err = a.UpdatePirState(pir, values)
+		if err != nil {
+			fmt.Printf("failed to update PIR[%s] status %v", pir.name, err)
+		}
+	}
+	return err
 }
 
 func (a *app) setRelayState(oid string, newState state) error {
@@ -86,43 +113,66 @@ func (a *app) setRelayState(oid string, newState state) error {
 	v := gosnmp.SnmpPDU{
 		Name:  oid,
 		Type:  gosnmp.Integer,
-		Value: newState,
+		Value: int64(newState),
 	}
-	res, err := a.snmp.Set([]gosnmp.SnmpPDU{v})
+	_, err := a.snmp.Set([]gosnmp.SnmpPDU{v})
 	if err != nil {
 		return err
 	}
-	fmt.Printf("relay state set %v\n", res)
 	return nil
 }
 
 type pir struct {
-	name       string
-	enabled    bool
+	name string
+	// PIR is enabled if pin set to 0 (MANUAL)
+	enabled bool
+	// current state of the relay
 	state      state
 	lastChange time.Time
-	schedule   *pirSchedule
 	timeout    time.Duration
 
+	scheduleFrom int64
+	scheduleTo   int64
+	// timestamp when state changed to ON
+	// used for tracking a single session duration
 	turnedOn time.Time
 
-	stateOid  string
-	modeOid   string
-	switchOid string
+	stateOid        string
+	modeOid         string
+	switchOid       string
+	scheduleFromOid string
+	scheduleToOid   string
 
 	// Duration of lights being on
 	durationMetric *metrics.Summary
 }
 
-func NewPir(name string, stateOid string, modeOid string, switchOid string) *pir {
+func NewPir(name, stateOid, modeOid, switchOid, scheduleFromOid, scheduleToOid string) *pir {
 	return &pir{
-		name:           name,
-		enabled:        true,
-		stateOid:       stateOid,
-		modeOid:        modeOid,
-		switchOid:      switchOid,
-		durationMetric: metrics.NewSummary(fmt.Sprintf(`ligths_on_seconds{pir="%s"}`, name)),
+		name:            name,
+		enabled:         true,
+		stateOid:        stateOid,
+		modeOid:         modeOid,
+		switchOid:       switchOid,
+		scheduleFromOid: scheduleFromOid,
+		scheduleToOid:   scheduleToOid,
+		durationMetric:  metrics.NewSummary(fmt.Sprintf(`ligths_state_on_seconds{pir="%s"}`, name)),
 	}
+}
+
+// ValidTime returns True if neither From time nor To time is set
+// or if current hour is in between From and To
+func (p *pir) ValidTime() bool {
+	if p.scheduleFrom == 0 && p.scheduleTo == 0 {
+		return true
+	}
+	currentHour := int64(time.Now().Hour())
+	return p.scheduleFrom <= currentHour && currentHour < p.scheduleTo
+}
+
+func (p *pir) UpdateSchedule(data map[string]int64) {
+	p.scheduleTo = int2Hour(data[p.scheduleToOid])
+	p.scheduleFrom = int2Hour(data[p.scheduleFromOid])
 }
 
 func (a *app) UpdatePirState(pir *pir, data map[string]int64) error {
@@ -133,9 +183,13 @@ func (a *app) UpdatePirState(pir *pir, data map[string]int64) error {
 		return nil
 	}
 	newState := state(data[pir.stateOid])
+	// expose relay state as a metric
+	metrics.GetOrCreateGauge(fmt.Sprintf(`lights_state{pir="%s"}`, pir.name), func() float64 {
+		return float64(newState)
+	})
 	switch pir.state {
 	case stateOff:
-		if !pir.schedule.ValidTime() {
+		if !pir.ValidTime() {
 			return nil
 		}
 		// turnOn the lights
@@ -144,15 +198,27 @@ func (a *app) UpdatePirState(pir *pir, data map[string]int64) error {
 			if err != nil {
 				return fmt.Errorf("failed to set value to the pir %v\n", err)
 			}
-			pir.turnedOn = time.Now()
+			pir.turnedOn = a.clock.Now()
 			pir.state = newState
+			go func() {
+				ticker := time.NewTicker(time.Second)
+				for {
+					select {
+					case <-ticker.C:
+						if !pir.enabled {
+							return
+						}
+						// TODO: if shouldTurnOff { turnOff and return }
+					}
+				}
+			}()
 		}
 		// reset the clock
 		pir.lastChange = time.Time{}
 	case stateOn:
 		if newState == stateOff {
-			pir.lastChange = time.Now()
-			shouldTurnOff := !pir.lastChange.IsZero() && time.Now().Sub(pir.lastChange) > pir.timeout
+			pir.lastChange = a.clock.Now()
+			shouldTurnOff := !pir.lastChange.IsZero() && a.clock.Now().Sub(pir.lastChange) > pir.timeout
 			if shouldTurnOff {
 				err := a.setRelayState(pir.switchOid, stateOff)
 				if err != nil {
@@ -166,36 +232,6 @@ func (a *app) UpdatePirState(pir *pir, data map[string]int64) error {
 		}
 	}
 	return nil
-}
-
-type pirSchedule struct {
-	From int64
-	To   int64
-
-	fromOid string
-	toOid   string
-}
-
-func NewPirSchedule(fromOid string, toOid string) *pirSchedule {
-	return &pirSchedule{
-		fromOid: fromOid,
-		toOid:   toOid,
-	}
-}
-
-// ValidTime returns True if neither From time nor To time is set
-// or if current hour is in between From and To
-func (ps *pirSchedule) ValidTime() bool {
-	if ps.From == 0 && ps.To == 0 {
-		return true
-	}
-	currentHour := int64(time.Now().Hour())
-	return ps.From <= currentHour && currentHour < ps.To
-}
-
-func (ps *pirSchedule) UpdateState(data map[string]int64) {
-	ps.To = int2Hour(data[ps.toOid])
-	ps.From = int2Hour(data[ps.fromOid])
 }
 
 // int2Hour returns hour value from the device
@@ -228,12 +264,14 @@ func main() {
 		log.Fatalf("Connect() err: %v", err)
 	}
 	a := &app{
-		snmp: c,
-		pir1: NewPir("short", pir1State, pir1Mode, relay1Id),
-		pir2: NewPir("long", pir2State, pir2Mode, relay2Id),
+		snmp:  c,
+		clock: clockwork.NewRealClock(),
+		pirs: map[string]*pir{
+			"first":  NewPir("first", pir1State, pir1Mode, relay1Id, relay1WorkFrom, relay1WorkTo),
+			"second": NewPir("second", pir2State, pir2Mode, relay2Id, relay2WorkFrom, relay2WorkTo),
+		},
+		timeoutOid: pirTimeout,
 	}
-	a.pir1.schedule = NewPirSchedule(relay1WorkFrom, relay1WorkTo)
-	a.pir2.schedule = NewPirSchedule(relay2WorkFrom, relay2WorkTo)
 	err = a.setAppState()
 	if err != nil {
 		log.Fatalf("failed to get initial state: %v\n", err)
@@ -246,7 +284,7 @@ func main() {
 
 	server := http.Server{Addr: *httpAddr}
 	wg.Add(1)
-	go func(){
+	go func() {
 		// Expose the registered metrics at `/metrics` path.
 		http.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
 			metrics.WritePrometheus(w, true)
@@ -256,8 +294,7 @@ func main() {
 			log.Fatalf("failed to start metrics server %v\n", err)
 		}
 		wg.Done()
-	} ()
-
+	}()
 
 	wg.Add(1)
 	go func() {
