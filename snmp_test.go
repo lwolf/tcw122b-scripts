@@ -3,8 +3,9 @@ package main
 import (
 	"fmt"
 	"testing"
+	"time"
 
-	"github.com/jonboulle/clockwork"
+	"github.com/LopatkinEvgeniy/clock"
 	"github.com/soniah/gosnmp"
 )
 
@@ -66,15 +67,15 @@ func getCurrentState(snmp snmpGetterSetter, values []string) map[string]int64 {
 }
 
 const (
-	fakeStateOid        = "stateOid"
-	fakeModeOid         = "modeOid"
-	fakeSwitchOid       = "switchOid"
+	fakeStateOid        = "pirStateOid"
+	fakeModeOid         = "operationModeOid"
+	fakeSwitchOid       = "relayOid"
 	fakescheduleFromOid = "scheduleFrom"
 	fakescheduleToOid   = "scheduleTo"
 	fakeTimeoutOid      = "timeout"
 )
 
-func dumpPir(t *testing.T, pir *pir) (result map[string]int64){
+func dumpPir(t *testing.T, pir *pir) (result map[string]int64) {
 	t.Helper()
 	var pirMode int64
 	if pir.enabled {
@@ -83,10 +84,10 @@ func dumpPir(t *testing.T, pir *pir) (result map[string]int64){
 		pirMode = 4
 	}
 	return map[string]int64{
-		pir.scheduleToOid: pir.scheduleTo,
-		pir.scheduleFromOid: pir.scheduleFrom,
-		pir.modeOid: pirMode,
-		pir.switchOid: int64(pir.state),
+		pir.scheduleToOid:    pir.scheduleTo,
+		pir.scheduleFromOid:  pir.scheduleFrom,
+		pir.operationModeOid: pirMode,
+		pir.relayOid:         int64(pir.relayState),
 	}
 }
 
@@ -94,7 +95,7 @@ func expectedLocalState(t *testing.T, state map[string]int64, expected map[strin
 	t.Helper()
 	for k, v := range expected {
 		if state[k] != v {
-			t.Fatalf("expected pir state for key=%s to be %d, got %d", k, v, state[k])
+			t.Fatalf("expected pir relayState for key=%s to be %d, got %d", k, v, state[k])
 		}
 	}
 }
@@ -108,73 +109,107 @@ func expectedRemoteState(t *testing.T, snmp snmpGetterSetter, values map[string]
 	state := getCurrentState(snmp, keys)
 	for k, v := range values {
 		if state[k] != v {
-			t.Fatalf("expected remote state for key=%s to be %d, got %d", k, v, state[k])
+			t.Fatalf("expected remote relayState for key=%s to be %d, got %d", k, v, state[k])
 		}
 	}
 }
 
-func TestLightSwitch(t *testing.T) {
-	pirName := "testPir"
-	fc := clockwork.NewFakeClock()
-	app := &app{
-		snmp: NewMockedSnmp(map[string]int64{
-			fakeStateOid:        0,
-			fakeModeOid:         0,
-			fakeSwitchOid:       0,
-			fakescheduleFromOid: 0,
-			fakescheduleToOid:   0,
-			fakeTimeoutOid:      0,
-		}),
-		clock:      fc,
-		timeoutOid: fakeTimeoutOid,
-		pirs: map[string]*pir{pirName: NewPir(
-			pirName,
-			fakeStateOid,
-			fakeModeOid,
-			fakeSwitchOid,
-			fakescheduleFromOid,
-			fakescheduleToOid,
-		)},
+func TestSchedule(t *testing.T) {
+	_ = map[string]struct {
+	}{
+		"should work anytime with scheduling disabled":         {},
+		"should turnOff without events after timout":           {},
+		"should not turnOff after timout if there were events": {},
+		// if switch goes on during schedule enabled timeframe, but
+		// then schedule goes to disabled, switch should go offline
+		// after default timeout
+		"should handle transition between schedule enabled/disabled": {},
 	}
-	// change the state of the PIR
-	_, err := app.snmp.Set([]gosnmp.SnmpPDU{*makePDU(fakeStateOid, 1)})
-	if err != nil {
-		t.Fatalf("unexpected error trying to set value %v", err)
-	}
-
-	// get the state and make sure that switch logic works
-	err = app.setAppState()
-	if err != nil {
-		t.Fatalf("failed to set app state %v", err)
-	}
-	pir := app.pirByName(pirName)
-	pirState := dumpPir(t, pir)
-	expectedLocalState(t, pirState, map[string]int64{fakeSwitchOid: 1})
-	expectedRemoteState(t, app.snmp, map[string]int64{fakeSwitchOid: 1})
-
 }
 
-func TestApp(t *testing.T) {
-	tests := map[string]struct {
-		state    map[string]int64
-		expState map[string]int64
-	}{
-		"should switch lights on on new event": {
-			state: map[string]int64{
-				"stateOid":  0,
-				"modeOid":   0,
-				"switchOid": 0,
-			},
-		},
-		"test2": {},
+func TestWorkflow(t *testing.T) {
+	pirName := "pir"
+	initialState := map[string]int64{
+		fakeStateOid:        0,
+		fakeModeOid:         0,
+		fakeSwitchOid:       0,
+		fakescheduleFromOid: 0,
+		fakescheduleToOid:   0,
+		fakeTimeoutOid:      15,
 	}
-	fc := clockwork.NewFakeClock()
-	for testName, tc := range tests {
-		t.Run(testName, func(t *testing.T) {
-			_ = &app{
-				snmp:  NewMockedSnmp(tc.state),
-				clock: fc,
-			}
-		})
+	initialTime := time.Date(2010, time.April, 10, 14, 30, 0, 0, time.UTC)
+	steps := []struct {
+		name             string
+		after            time.Duration
+		patchRemoteState []gosnmp.SnmpPDU
+		expPirLastChange time.Time
+		expPirState      map[string]int64
+		expRemoteState   map[string]int64
+	}{
+		{
+			name:             "should switch lights on on new event",
+			after:            time.Second,
+			patchRemoteState: []gosnmp.SnmpPDU{*makePDU(fakeStateOid, 1)},
+			expPirState:      map[string]int64{fakeSwitchOid: 1},
+			expRemoteState:   map[string]int64{fakeSwitchOid: 1},
+		}, {
+			name:             "should not switch off before timeout",
+			after:            5 * time.Second,
+			patchRemoteState: []gosnmp.SnmpPDU{*makePDU(fakeStateOid, 0)},
+			expPirState:      map[string]int64{fakeSwitchOid: 1},
+			expRemoteState:   map[string]int64{fakeSwitchOid: 1},
+		}, {
+			name:             "should reset timeout on PIR events",
+			after:            5 * time.Second,
+			patchRemoteState: []gosnmp.SnmpPDU{*makePDU(fakeStateOid, 1)},
+			expPirState:      map[string]int64{fakeSwitchOid: 1},
+			expRemoteState:   map[string]int64{fakeSwitchOid: 1},
+		}, {
+			name:             "should set timeout",
+			after:            5 * time.Second,
+			patchRemoteState: []gosnmp.SnmpPDU{*makePDU(fakeStateOid, 0)},
+			expPirState:      map[string]int64{fakeSwitchOid: 1},
+			expRemoteState:   map[string]int64{fakeSwitchOid: 1},
+		}, {
+			name:             "should switch off after timeout",
+			after:            20 * time.Second,
+			patchRemoteState: []gosnmp.SnmpPDU{*makePDU(fakeStateOid, 0)},
+			expPirState:      map[string]int64{fakeSwitchOid: 0},
+			expRemoteState:   map[string]int64{fakeSwitchOid: 0},
+		},
+	}
+	testPir := NewPir(
+		pirName,
+		fakeStateOid,
+		fakeModeOid,
+		fakeSwitchOid,
+		fakescheduleFromOid,
+		fakescheduleToOid,
+	)
+	fc := clock.NewFakeClockAt(initialTime)
+	app := &app{
+		snmp:       NewMockedSnmp(initialState),
+		clock:      fc,
+		timeoutOid: fakeTimeoutOid,
+		pirs:       map[string]*pir{pirName: testPir},
+	}
+	t.Log("Initialization done, iterating over steps")
+	for i, tc := range steps {
+		t.Logf("[%d] `%s`", i+1, tc.name)
+		// patch remote state
+		_, err := app.snmp.Set(tc.patchRemoteState)
+		if err != nil {
+			t.Fatalf("failed to patch remote state %v", err)
+		}
+		// scroll the time to the future
+		fc.Advance(tc.after)
+		// get the relayState and make sure that switch logic works
+		err = app.setAppState()
+		if err != nil {
+			t.Fatalf("failed to set app relayState %v", err)
+		}
+		// t.Logf("now %v; pir lastChange %v\n", app.clock.Now(), app.pirByName(pirName).lastChange)
+		expectedLocalState(t, dumpPir(t, app.pirByName(pirName)), tc.expPirState)
+		expectedRemoteState(t, app.snmp, tc.expRemoteState)
 	}
 }

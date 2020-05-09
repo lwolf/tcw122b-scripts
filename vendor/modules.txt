@@ -1,9 +1,11 @@
+# github.com/LopatkinEvgeniy/clock v0.0.0-20181129135056-768e3044b657
+## explicit
+github.com/LopatkinEvgeniy/clock
 # github.com/VictoriaMetrics/metrics v1.11.2
 ## explicit
 github.com/VictoriaMetrics/metrics
 # github.com/jonboulle/clockwork v0.1.0
 ## explicit
-github.com/jonboulle/clockwork
 # github.com/soniah/gosnmp v1.25.0
 ## explicit
 github.com/soniah/gosnmp

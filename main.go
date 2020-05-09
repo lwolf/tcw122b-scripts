@@ -12,12 +12,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/LopatkinEvgeniy/clock"
 	"github.com/VictoriaMetrics/metrics"
-	"github.com/jonboulle/clockwork"
 	"github.com/soniah/gosnmp"
 )
 
-type state int64
+type relayState int64
 
 var (
 	// Number of SNMP calls
@@ -33,27 +33,27 @@ type snmpGetterSetter interface {
 }
 
 const (
-	stateOff state = 0
-	stateOn  state = 1
+	relayOff relayState = 0
+	relayOn  relayState = 1
 
 	pirTimeout = "1.3.6.1.4.1.38783.2.9.3.0" // RELAY_PULSE_VALUE
 
-	relay1WorkFrom = "1.3.6.1.4.1.38783.2.5.1.3.0" // HUMIDITY_MIN_VALUE
-	relay1WorkTo   = "1.3.6.1.4.1.38783.2.5.1.4.0" // HUMIDITY_MAX_VALUE
-	pir1Mode       = "1.3.6.1.4.1.38783.2.9.1.0"
-	relay1Id       = "1.3.6.1.4.1.38783.3.3.0"
-	pir1State      = "1.3.6.1.4.1.38783.3.1.0"
+	relayAEnabledFromOid = "1.3.6.1.4.1.38783.2.5.1.3.0" // HUMIDITY_MIN_VALUE
+	relayAEnabledToOid   = "1.3.6.1.4.1.38783.2.5.1.4.0" // HUMIDITY_MAX_VALUE
+	relayAOid            = "1.3.6.1.4.1.38783.3.3.0"
+	pirAModeOid          = "1.3.6.1.4.1.38783.2.9.1.0"
+	pirAStateOid         = "1.3.6.1.4.1.38783.3.1.0"
 
-	relay2WorkFrom = "1.3.6.1.4.1.38783.2.5.1.1.0" // TEMP1_MIN_VALUE
-	relay2WorkTo   = "1.3.6.1.4.1.38783.2.5.1.2.0" // TEMP1_MAX_VALUE
-	pir2Mode       = "1.3.6.1.4.1.38783.2.9.2.0"
-	relay2Id       = "1.3.6.1.4.1.38783.3.5.0"
-	pir2State      = "1.3.6.1.4.1.38783.3.2.0"
+	relayBEnabledFromOid = "1.3.6.1.4.1.38783.2.5.1.1.0" // TEMP1_MIN_VALUE
+	relayBEnabledToOid   = "1.3.6.1.4.1.38783.2.5.1.2.0" // TEMP1_MAX_VALUE
+	relayBOid            = "1.3.6.1.4.1.38783.3.5.0"
+	pirBModeOid          = "1.3.6.1.4.1.38783.2.9.2.0"
+	pirBStateOid         = "1.3.6.1.4.1.38783.3.2.0"
 )
 
 type app struct {
 	snmp  snmpGetterSetter
-	clock clockwork.Clock
+	clock clock.Clock
 
 	pirs       map[string]*pir
 	timeoutOid string
@@ -74,7 +74,7 @@ func (a *app) pirByName(name string) *pir {
 func (a *app) collectOids() (oids []string) {
 	oids = append(oids, a.timeoutOid)
 	for _, pir := range a.pirs {
-		oids = append(oids, pir.stateOid, pir.modeOid, pir.switchOid, pir.scheduleFromOid, pir.scheduleToOid)
+		oids = append(oids, pir.pirStateOid, pir.operationModeOid, pir.relayOid, pir.scheduleFromOid, pir.scheduleToOid)
 	}
 	return
 }
@@ -108,8 +108,8 @@ func (a *app) setAppState() error {
 	return err
 }
 
-func (a *app) setRelayState(oid string, newState state) error {
-	fmt.Printf("[%s] setting relay state to %d\n", oid, newState)
+func (a *app) setRelayState(oid string, newState relayState) error {
+	// fmt.Printf("[%s] setting relay relayState to %d\n", oid, newState)
 	v := gosnmp.SnmpPDU{
 		Name:  oid,
 		Type:  gosnmp.Integer,
@@ -126,22 +126,22 @@ type pir struct {
 	name string
 	// PIR is enabled if pin set to 0 (MANUAL)
 	enabled bool
-	// current state of the relay
-	state      state
+	// current relayState of the relay
+	relayState relayState
 	lastChange time.Time
 	timeout    time.Duration
 
 	scheduleFrom int64
 	scheduleTo   int64
-	// timestamp when state changed to ON
+	// timestamp when relayState changed to ON
 	// used for tracking a single session duration
 	turnedOn time.Time
 
-	stateOid        string
-	modeOid         string
-	switchOid       string
-	scheduleFromOid string
-	scheduleToOid   string
+	pirStateOid      string
+	operationModeOid string
+	relayOid         string
+	scheduleFromOid  string
+	scheduleToOid    string
 
 	// Duration of lights being on
 	durationMetric *metrics.Summary
@@ -149,14 +149,14 @@ type pir struct {
 
 func NewPir(name, stateOid, modeOid, switchOid, scheduleFromOid, scheduleToOid string) *pir {
 	return &pir{
-		name:            name,
-		enabled:         true,
-		stateOid:        stateOid,
-		modeOid:         modeOid,
-		switchOid:       switchOid,
-		scheduleFromOid: scheduleFromOid,
-		scheduleToOid:   scheduleToOid,
-		durationMetric:  metrics.NewSummary(fmt.Sprintf(`ligths_state_on_seconds{pir="%s"}`, name)),
+		name:             name,
+		enabled:          true,
+		pirStateOid:      stateOid,
+		operationModeOid: modeOid,
+		relayOid:         switchOid,
+		scheduleFromOid:  scheduleFromOid,
+		scheduleToOid:    scheduleToOid,
+		durationMetric:   metrics.NewSummary(fmt.Sprintf(`ligths_state_on_seconds{pir="%s"}`, name)),
 	}
 }
 
@@ -176,30 +176,30 @@ func (p *pir) UpdateSchedule(data map[string]int64) {
 }
 
 func (a *app) UpdatePirState(pir *pir, data map[string]int64) error {
-	pir.enabled = data[pir.modeOid] == 0
+	pir.enabled = data[pir.operationModeOid] == 0
 	if !pir.enabled {
 		pir.lastChange = time.Time{}
-		pir.state = stateOff
+		pir.relayState = relayOff
 		return nil
 	}
-	newState := state(data[pir.stateOid])
-	// expose relay state as a metric
+	newState := relayState(data[pir.pirStateOid])
+	// expose relay relayState as a metric
 	metrics.GetOrCreateGauge(fmt.Sprintf(`lights_state{pir="%s"}`, pir.name), func() float64 {
 		return float64(newState)
 	})
-	switch pir.state {
-	case stateOff:
+	switch pir.relayState {
+	case relayOff:
 		if !pir.ValidTime() {
 			return nil
 		}
 		// turnOn the lights
-		if newState == stateOn {
-			err := a.setRelayState(pir.switchOid, newState)
+		if newState == relayOn {
+			err := a.setRelayState(pir.relayOid, newState)
 			if err != nil {
 				return fmt.Errorf("failed to set value to the pir %v\n", err)
 			}
 			pir.turnedOn = a.clock.Now()
-			pir.state = newState
+			pir.relayState = newState
 			go func() {
 				ticker := time.NewTicker(time.Second)
 				for {
@@ -215,18 +215,19 @@ func (a *app) UpdatePirState(pir *pir, data map[string]int64) error {
 		}
 		// reset the clock
 		pir.lastChange = time.Time{}
-	case stateOn:
-		if newState == stateOff {
-			pir.lastChange = a.clock.Now()
+	case relayOn:
+		if newState == relayOff {
 			shouldTurnOff := !pir.lastChange.IsZero() && a.clock.Now().Sub(pir.lastChange) > pir.timeout
 			if shouldTurnOff {
-				err := a.setRelayState(pir.switchOid, stateOff)
+				err := a.setRelayState(pir.relayOid, relayOff)
 				if err != nil {
 					return fmt.Errorf("failed to set value to the pir %v\n", err)
 				}
-				pir.state = stateOff
+				pir.relayState = relayOff
 				pir.durationMetric.UpdateDuration(pir.turnedOn)
+				return nil
 			}
+			pir.lastChange = a.clock.Now()
 		} else {
 			pir.lastChange = time.Time{}
 		}
@@ -265,16 +266,16 @@ func main() {
 	}
 	a := &app{
 		snmp:  c,
-		clock: clockwork.NewRealClock(),
+		clock: clock.NewRealClock(),
 		pirs: map[string]*pir{
-			"first":  NewPir("first", pir1State, pir1Mode, relay1Id, relay1WorkFrom, relay1WorkTo),
-			"second": NewPir("second", pir2State, pir2Mode, relay2Id, relay2WorkFrom, relay2WorkTo),
+			"first":  NewPir("first", pirAStateOid, pirAModeOid, relayAOid, relayAEnabledFromOid, relayAEnabledToOid),
+			"second": NewPir("second", pirBStateOid, pirBModeOid, relayBOid, relayBEnabledFromOid, relayBEnabledToOid),
 		},
 		timeoutOid: pirTimeout,
 	}
 	err = a.setAppState()
 	if err != nil {
-		log.Fatalf("failed to get initial state: %v\n", err)
+		log.Fatalf("failed to get initial relayState: %v\n", err)
 	}
 
 	var wg sync.WaitGroup
@@ -311,7 +312,7 @@ func main() {
 			case <-ticker.C:
 				err = a.setAppState()
 				if err != nil {
-					fmt.Printf("failed to query remote state %v\n", err)
+					fmt.Printf("failed to query remote relayState %v\n", err)
 				}
 			}
 		}
