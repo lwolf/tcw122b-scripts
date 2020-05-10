@@ -32,6 +32,11 @@ type snmpGetterSetter interface {
 	Set([]gosnmp.SnmpPDU) (*gosnmp.SnmpPacket, error)
 }
 
+type Unit struct {
+	oid   string
+	value int64
+}
+
 const (
 	relayOff relayState = 0
 	relayOn  relayState = 1
@@ -74,7 +79,7 @@ func (a *app) pirByName(name string) *pir {
 func (a *app) collectOids() (oids []string) {
 	oids = append(oids, a.timeoutOid)
 	for _, pir := range a.pirs {
-		oids = append(oids, pir.pirStateOid, pir.operationModeOid, pir.relayOid, pir.scheduleFromOid, pir.scheduleToOid)
+		oids = append(oids, pir.state.oid, pir.enabled.oid, pir.relay.oid, pir.scheduleFrom.oid, pir.scheduleTo.oid)
 	}
 	return
 }
@@ -122,26 +127,35 @@ func (a *app) setRelayState(oid string, newState relayState) error {
 	return nil
 }
 
+func (a *app) BackgroundCheck() {
+	for _, pir := range a.pirs {
+		if !pir.Enabled() {
+			continue
+		}
+		if relayState(pir.relay.value) == relayOn {
+			if err := a.MaybeTurnPirOff(pir); err != nil {
+				fmt.Printf("failed to run `MaybeTurnPirOff` check %v\n", err)
+			}
+		}
+	}
+}
+
 type pir struct {
 	name string
+	// remote state of the PIR
+	state Unit
 	// PIR is enabled if pin set to 0 (MANUAL)
-	enabled bool
+	enabled Unit
 	// current relayState of the relay
-	relayState relayState
+	relay Unit
+	// timestamp when relayState changed to ON
+	// used for tracking a single session duration
+	turnedOn   time.Time
 	lastChange time.Time
 	timeout    time.Duration
 
-	scheduleFrom int64
-	scheduleTo   int64
-	// timestamp when relayState changed to ON
-	// used for tracking a single session duration
-	turnedOn time.Time
-
-	pirStateOid      string
-	operationModeOid string
-	relayOid         string
-	scheduleFromOid  string
-	scheduleToOid    string
+	scheduleFrom Unit
+	scheduleTo   Unit
 
 	// Duration of lights being on
 	durationMetric *metrics.Summary
@@ -149,93 +163,105 @@ type pir struct {
 
 func NewPir(name, stateOid, modeOid, switchOid, scheduleFromOid, scheduleToOid string) *pir {
 	return &pir{
-		name:             name,
-		enabled:          true,
-		pirStateOid:      stateOid,
-		operationModeOid: modeOid,
-		relayOid:         switchOid,
-		scheduleFromOid:  scheduleFromOid,
-		scheduleToOid:    scheduleToOid,
-		durationMetric:   metrics.NewSummary(fmt.Sprintf(`ligths_state_on_seconds{pir="%s"}`, name)),
+		name:           name,
+		enabled:        Unit{oid: modeOid, value: 1},
+		state:          Unit{oid: stateOid},
+		relay:          Unit{oid: switchOid},
+		scheduleFrom:   Unit{oid: scheduleFromOid},
+		scheduleTo:     Unit{oid: scheduleToOid},
+		durationMetric: metrics.NewSummary(fmt.Sprintf(`ligths_state_on_seconds{pir="%s"}`, name)),
 	}
+}
+
+func (p *pir) Enabled() bool {
+	// Corresponding remote flag has following values:
+	// 		MANUAL = 0
+	// 		DIGITALINPUT1 = 4  # PIR1
+	// 		DIGITALINPUT2 = 8  # PIR2
+	// We're interested in the Manual mode, which corresponds to
+	// the enabled remote control
+	return p.enabled.value == 0
 }
 
 // ValidTime returns True if neither From time nor To time is set
 // or if current hour is in between From and To
 func (p *pir) ValidTime(clock clock.Clock) bool {
-	if p.scheduleFrom == 0 && p.scheduleTo == 0 {
+	startHour := p.scheduleFrom.value
+	endHour := p.scheduleTo.value
+	if startHour == 0 && endHour == 0 {
 		return true
 	}
 	currentHour := int64(clock.Now().Hour())
-	if p.scheduleFrom > p.scheduleTo {
+	if startHour > endHour {
 		// handles the case when scheduler is configured to work during the night
 		// e.g. From 20:00 till 5:00
-		return p.scheduleFrom <= currentHour || currentHour < p.scheduleTo
+		return startHour <= currentHour || currentHour < endHour
 	} else {
-		return p.scheduleFrom <= currentHour && currentHour < p.scheduleTo
+		return startHour <= currentHour && currentHour < endHour
 	}
 }
 
 func (p *pir) UpdateSchedule(data map[string]int64) {
-	p.scheduleTo = int2Hour(data[p.scheduleToOid])
-	p.scheduleFrom = int2Hour(data[p.scheduleFromOid])
+	p.scheduleTo.value = int2Hour(data[p.scheduleTo.oid])
+	p.scheduleFrom.value = int2Hour(data[p.scheduleFrom.oid])
+}
+
+func (a *app) MaybeTurnOn(pir *pir, newState relayState) error {
+	if !pir.ValidTime(a.clock) {
+		return nil
+	}
+	// turnOn the lights
+	if newState == relayOn {
+		err := a.setRelayState(pir.relay.oid, newState)
+		if err != nil {
+			return fmt.Errorf("failed to set value to the pir %v\n", err)
+		}
+		pir.turnedOn = a.clock.Now()
+		pir.lastChange = a.clock.Now()
+		pir.relay.value = int64(newState)
+	}
+	return nil
+}
+
+func (a *app) MaybeTurnPirOff(pir *pir) error {
+	shouldTurnOff := !pir.lastChange.IsZero() && a.clock.Now().Sub(pir.lastChange) > pir.timeout
+	if !shouldTurnOff {
+		return nil
+	}
+	err := a.setRelayState(pir.relay.oid, relayOff)
+	if err != nil {
+		return fmt.Errorf("failed to set value to the pir %v\n", err)
+	}
+	pir.relay.value = int64(relayOff)
+	pir.durationMetric.UpdateDuration(pir.turnedOn)
+	return nil
 }
 
 func (a *app) UpdatePirState(pir *pir, data map[string]int64) error {
-	pir.enabled = data[pir.operationModeOid] == 0
-	if !pir.enabled {
+	pir.enabled.value = data[pir.enabled.oid]
+	isEnabled := pir.enabled.value == 0
+	if !isEnabled {
 		pir.lastChange = time.Time{}
-		pir.relayState = relayOff
+		pir.relay.value = int64(relayOff)
 		return nil
 	}
-	newState := relayState(data[pir.pirStateOid])
+	newState := relayState(data[pir.state.oid])
 	// expose relay relayState as a metric
 	metrics.GetOrCreateGauge(fmt.Sprintf(`lights_state{pir="%s"}`, pir.name), func() float64 {
 		return float64(newState)
 	})
-	switch pir.relayState {
+	switch relayState(pir.relay.value) {
 	case relayOff:
-		if !pir.ValidTime(a.clock) {
-			return nil
+		if err := a.MaybeTurnOn(pir, newState); err != nil {
+			return err
 		}
-		// turnOn the lights
-		if newState == relayOn {
-			err := a.setRelayState(pir.relayOid, newState)
-			if err != nil {
-				return fmt.Errorf("failed to set value to the pir %v\n", err)
-			}
-			pir.turnedOn = a.clock.Now()
-			pir.relayState = newState
-			go func() {
-				ticker := time.NewTicker(time.Second)
-				for {
-					select {
-					case <-ticker.C:
-						if !pir.enabled {
-							return
-						}
-						// TODO: if shouldTurnOff { turnOff and return }
-					}
-				}
-			}()
-		}
-		// reset the clock
-		pir.lastChange = time.Time{}
 	case relayOn:
 		if newState == relayOff {
-			shouldTurnOff := !pir.lastChange.IsZero() && a.clock.Now().Sub(pir.lastChange) > pir.timeout
-			if shouldTurnOff {
-				err := a.setRelayState(pir.relayOid, relayOff)
-				if err != nil {
-					return fmt.Errorf("failed to set value to the pir %v\n", err)
-				}
-				pir.relayState = relayOff
-				pir.durationMetric.UpdateDuration(pir.turnedOn)
-				return nil
+			if err := a.MaybeTurnPirOff(pir); err != nil {
+				return err
 			}
-			pir.lastChange = a.clock.Now()
 		} else {
-			pir.lastChange = time.Time{}
+			pir.lastChange = a.clock.Now()
 		}
 	}
 	return nil
@@ -270,9 +296,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("Connect() err: %v", err)
 	}
+	cl := clock.NewRealClock()
 	a := &app{
 		snmp:  c,
-		clock: clock.NewRealClock(),
+		clock: cl,
 		pirs: map[string]*pir{
 			"first":  NewPir("first", pirAStateOid, pirAModeOid, relayAOid, relayAEnabledFromOid, relayAEnabledToOid),
 			"second": NewPir("second", pirBStateOid, pirBModeOid, relayBOid, relayBEnabledFromOid, relayBEnabledToOid),
@@ -285,7 +312,7 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
-	ticker := time.NewTicker(300 * time.Millisecond)
+	ticker := cl.NewTicker(300 * time.Millisecond)
 	done := make(chan os.Signal)
 	signal.Notify(done, syscall.SIGHUP, syscall.SIGUSR2, syscall.SIGINT, syscall.SIGQUIT)
 
@@ -315,11 +342,12 @@ func main() {
 				}
 				wg.Done()
 				return
-			case <-ticker.C:
+			case <-ticker.Chan():
 				err = a.setAppState()
 				if err != nil {
 					fmt.Printf("failed to query remote relayState %v\n", err)
 				}
+				a.BackgroundCheck()
 			}
 		}
 	}()
