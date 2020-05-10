@@ -162,12 +162,18 @@ func NewPir(name, stateOid, modeOid, switchOid, scheduleFromOid, scheduleToOid s
 
 // ValidTime returns True if neither From time nor To time is set
 // or if current hour is in between From and To
-func (p *pir) ValidTime() bool {
+func (p *pir) ValidTime(clock clock.Clock) bool {
 	if p.scheduleFrom == 0 && p.scheduleTo == 0 {
 		return true
 	}
-	currentHour := int64(time.Now().Hour())
-	return p.scheduleFrom <= currentHour && currentHour < p.scheduleTo
+	currentHour := int64(clock.Now().Hour())
+	if p.scheduleFrom > p.scheduleTo {
+		// handles the case when scheduler is configured to work during the night
+		// e.g. From 20:00 till 5:00
+		return p.scheduleFrom <= currentHour || currentHour < p.scheduleTo
+	} else {
+		return p.scheduleFrom <= currentHour && currentHour < p.scheduleTo
+	}
 }
 
 func (p *pir) UpdateSchedule(data map[string]int64) {
@@ -189,7 +195,7 @@ func (a *app) UpdatePirState(pir *pir, data map[string]int64) error {
 	})
 	switch pir.relayState {
 	case relayOff:
-		if !pir.ValidTime() {
+		if !pir.ValidTime(a.clock) {
 			return nil
 		}
 		// turnOn the lights
