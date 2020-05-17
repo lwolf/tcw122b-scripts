@@ -162,7 +162,7 @@ func TestNonInteractiveSwitch(t *testing.T) {
 		t.Fatalf("failed to patch remote state %v", err)
 	}
 	// get the relayState and make sure that switch logic works
-	err = app.setAppState()
+	err = app.updateState()
 	if err != nil {
 		t.Fatalf("failed to set app relayState %v", err)
 	}
@@ -172,7 +172,6 @@ func TestNonInteractiveSwitch(t *testing.T) {
 	// scroll the time to the future
 	// advance time gradually, to make sure that
 	// background job could kick in any time
-	// TODO: remove after proper background worker implemented
 	for i := 0; i <= 16; i++ {
 		fc.Advance(time.Second)
 		app.BackgroundCheck()
@@ -236,24 +235,6 @@ func TestSchedule(t *testing.T) {
 			expPirState:      map[string]int64{fakeSwitchOid: 0},
 			expRemoteState:   map[string]int64{fakeSwitchOid: 0},
 		},
-		// if switch goes on during schedule enabled timeframe, but
-		// then schedule goes to disabled, switch should go offline
-		// after default timeout
-		// "should handle transition between schedule enabled/disabled": {
-		// 	initialState: map[string]int64{
-		// 		fakeStateOid:        0,
-		// 		fakeModeOid:         0,
-		// 		fakeSwitchOid:       0,
-		// 		fakescheduleFromOid: 200,
-		// 		fakescheduleToOid:   50,
-		// 		fakeTimeoutOid:      15,
-		// 	},
-		// 	initialTime:      time.Date(2010, time.April, 10, 19, 59, 50, 0, time.UTC),
-		// 	patchRemoteState: []gosnmp.SnmpPDU{*makePDU(fakeStateOid, 1)},
-		// 	after:            time.Minute,
-		// 	expPirState:      map[string]int64{fakeSwitchOid: 0},
-		// 	expRemoteState:   map[string]int64{fakeSwitchOid: 0},
-		// },
 	}
 	for testName, tc := range tests {
 		t.Run(testName, func(t *testing.T) {
@@ -261,7 +242,7 @@ func TestSchedule(t *testing.T) {
 			fc := clock.NewFakeClockAt(tc.initialTime)
 			app := createTestApp(t, pirName, tc.initialState, fc)
 			// set initial state from the remote
-			err := app.setAppState()
+			err := app.updateState()
 			if err != nil {
 				t.Fatalf("failed to set app relayState %v", err)
 			}
@@ -273,7 +254,7 @@ func TestSchedule(t *testing.T) {
 			// scroll the time to the future
 			fc.Advance(tc.after)
 			// get the relayState and make sure that switch logic works
-			err = app.setAppState()
+			err = app.updateState()
 			if err != nil {
 				t.Fatalf("failed to set app relayState %v", err)
 			}
@@ -281,6 +262,53 @@ func TestSchedule(t *testing.T) {
 			expectedRemoteState(t, app.snmp, tc.expRemoteState)
 		})
 	}
+}
+
+func TestCrossScheduleTransition(t *testing.T) {
+	// if switch goes on during schedule enabled timeframe, but
+	// then schedule goes to disabled, switch should go offline
+	// after default timeout
+	// "should handle transition between schedule enabled/disabled": {
+	initialState := map[string]int64{
+		fakeStateOid:        0,
+		fakeModeOid:         0,
+		fakeSwitchOid:       0,
+		fakescheduleFromOid: 200,
+		fakescheduleToOid:   50,
+		fakeTimeoutOid:      15,
+	}
+	patchRemoteState := []gosnmp.SnmpPDU{*makePDU(fakeStateOid, 1)}
+	expPirState := map[string]int64{fakeSwitchOid: 0}
+	expRemoteState := map[string]int64{fakeSwitchOid: 0}
+
+	initialTime := time.Date(2010, time.April, 10, 19, 59, 50, 0, time.UTC)
+	pirName := genPirName(t)
+	fc := clock.NewFakeClockAt(initialTime)
+	app := createTestApp(t, pirName, initialState, fc)
+	// set initial state from the remote
+	err := app.updateState()
+	if err != nil {
+		t.Fatalf("failed to set app relayState %v", err)
+	}
+	// patch remote state
+	_, err = app.snmp.Set(patchRemoteState)
+	if err != nil {
+		t.Fatalf("failed to patch remote state %v", err)
+	}
+	err = app.updateState()
+	if err != nil {
+		t.Fatalf("failed to set app relayState %v", err)
+	}
+	// advance time gradually, to make sure that
+	// background job could kick in any time
+	for i := 0; i <= 16; i++ {
+		fc.Advance(time.Second)
+		app.BackgroundCheck()
+	}
+	// get the relayState and make sure that switch logic works
+	expectedLocalState(t, dumpPir(t, app.pirByName(pirName)), expPirState)
+	expectedRemoteState(t, app.snmp, expRemoteState)
+
 }
 
 func TestWorkflow(t *testing.T) {
@@ -347,7 +375,7 @@ func TestWorkflow(t *testing.T) {
 		// scroll the time to the future
 		fc.Advance(tc.after)
 		// get the relayState and make sure that switch logic works
-		err = app.setAppState()
+		err = app.updateState()
 		if err != nil {
 			t.Fatalf("failed to set app relayState %v", err)
 		}
