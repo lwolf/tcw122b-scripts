@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lights-control
+  labels:
+    app: lights-control
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lights-control
+  template:
+    metadata:
+      labels:
+        app: lights-control
+      annotations:
+        prometheus.io/scrape: "true"
+    spec:
+      containers:
+      - name: lights
+        image: lwolf/tcw122b:13-443f6a1
+        imagePullPolicy: IfNotPresent
+        command:
+          - /usr/bin/lights
+          - -snmp-remote=172.44.0.200
+          - -addr=0.0.0.0:8000
+          - -debug=true
+        ports:
+          - containerPort: 8000
+            name: http
+        livenessProbe:
+          httpGet:
+            path: /metrics
+            port: 8000
+            scheme: HTTP
+          initialDelaySeconds: 30
+          timeoutSeconds: 5
