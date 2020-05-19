@@ -119,6 +119,7 @@ func createTestApp(t *testing.T, pirName string, initialState map[string]int64, 
 	return &app{
 		snmp:       NewMockedSnmp(initialState),
 		clock:      cl,
+		tz: time.UTC,
 		timeoutOid: fakeTimeoutOid,
 		pirs: map[string]*pir{pirName: NewPir(
 			pirName,

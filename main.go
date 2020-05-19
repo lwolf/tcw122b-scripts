@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
+	stdlog "log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,12 +14,15 @@ import (
 
 	"github.com/LopatkinEvgeniy/clock"
 	"github.com/VictoriaMetrics/metrics"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/soniah/gosnmp"
 )
 
 type relayState int64
 
 var (
+	Version string
 	// Number of SNMP calls
 	requestsTotal = metrics.NewCounter("requests_total")
 
@@ -49,8 +52,9 @@ const (
 	pirAModeOid          = "1.3.6.1.4.1.38783.2.9.1.0"
 	pirAStateOid         = "1.3.6.1.4.1.38783.3.1.0"
 
-	relayBEnabledFromOid = "1.3.6.1.4.1.38783.2.5.1.1.0" // TEMP1_MIN_VALUE
-	relayBEnabledToOid   = "1.3.6.1.4.1.38783.2.5.1.2.0" // TEMP1_MAX_VALUE
+	// temporary switch OIDs to test current behaviour
+	relayBEnabledFromOid = "1.3.6.1.4.1.38783.2.5.1.2.0" // TEMP1_MIN_VALUE
+	relayBEnabledToOid   = "1.3.6.1.4.1.38783.2.5.1.1.0" // TEMP1_MAX_VALUE
 	relayBOid            = "1.3.6.1.4.1.38783.3.5.0"
 	pirBModeOid          = "1.3.6.1.4.1.38783.2.9.2.0"
 	pirBStateOid         = "1.3.6.1.4.1.38783.3.2.0"
@@ -60,6 +64,7 @@ type app struct {
 	snmp         snmpGetterSetter
 	clock        clock.Clock
 	tickInterval time.Duration
+	tz           *time.Location
 
 	pirs       map[string]*pir
 	timeoutOid string
@@ -108,13 +113,14 @@ func (a *app) updateState() error {
 		pir.UpdateSchedule(values)
 		err = a.UpdatePirState(pir, values)
 		if err != nil {
-			fmt.Printf("failed to update PIR[%s] status %v", pir.name, err)
+			log.Error().Err(err).Str("pir", pir.name).Msg("failed to update state")
 		}
 	}
 	return err
 }
 
 func (a *app) setRelayState(oid string, newState relayState) error {
+	log.Debug().Str("oid", oid).Int64("state", int64(newState)).Msg("changing remote state")
 	// fmt.Printf("[%s] setting relay relayState to %d\n", oid, newState)
 	v := gosnmp.SnmpPDU{
 		Name:  oid,
@@ -137,7 +143,7 @@ func (a *app) ScheduleBackgroundUpdater(doneCh <-chan os.Signal) {
 			return
 		case <-ticker.Chan():
 			if err := a.updateState(); err != nil {
-				fmt.Printf("failed to update app status %v", err)
+				log.Error().Err(err).Msg("failed to update app status")
 			}
 			a.BackgroundCheck()
 		}
@@ -151,25 +157,26 @@ func (a *app) BackgroundCheck() {
 		}
 		if relayState(pir.relay.value) == relayOn {
 			if err := a.MaybeTurnPirOff(pir); err != nil {
-				fmt.Printf("failed to run `MaybeTurnPirOff` check %v\n", err)
+				log.Error().Err(err).Str("pir", pir.name).Msg("failed to run `MaybeTurnPirOff` check")
 			}
 		}
 	}
 }
 
 func (a *app) MaybeTurnPirOn(pir *pir, newState relayState) error {
-	if !pir.ValidTime(a.clock) {
+	if !pir.ValidTime(a.clock, a.tz) {
 		return nil
 	}
 	// turnOn the lights
 	if newState == relayOn {
 		err := a.setRelayState(pir.relay.oid, newState)
 		if err != nil {
-			return fmt.Errorf("failed to set value to the pir %v\n", err)
+			return fmt.Errorf("failed to set value to the pir %w\n", err)
 		}
 		pir.turnedOn = a.clock.Now()
 		pir.lastChange = a.clock.Now()
 		pir.relay.value = int64(newState)
+		log.Debug().Str("pir", pir.name).Msg("changed relay state to relayON")
 	}
 	return nil
 }
@@ -181,10 +188,11 @@ func (a *app) MaybeTurnPirOff(pir *pir) error {
 	}
 	err := a.setRelayState(pir.relay.oid, relayOff)
 	if err != nil {
-		return fmt.Errorf("failed to set value to the pir %v\n", err)
+		return fmt.Errorf("failed to set value to the pir %w\n", err)
 	}
 	pir.relay.value = int64(relayOff)
 	pir.durationMetric.UpdateDuration(pir.turnedOn)
+	log.Debug().Str("pir", pir.name).Msg("changing relay state to relayOff")
 	return nil
 }
 
@@ -192,6 +200,7 @@ func (a *app) UpdatePirState(pir *pir, data map[string]int64) error {
 	pir.enabled.value = data[pir.enabled.oid]
 	isEnabled := pir.enabled.value == 0
 	if !isEnabled {
+		log.Debug().Str("pir", pir.name).Msg("pir is disabled")
 		pir.lastChange = time.Time{}
 		pir.relay.value = int64(relayOff)
 		return nil
@@ -263,13 +272,13 @@ func (p *pir) Enabled() bool {
 
 // ValidTime returns True if neither From time nor To time is set
 // or if current hour is in between From and To
-func (p *pir) ValidTime(clock clock.Clock) bool {
+func (p *pir) ValidTime(clock clock.Clock, tz *time.Location) bool {
 	startHour := p.scheduleFrom.value
 	endHour := p.scheduleTo.value
 	if startHour == 0 && endHour == 0 {
 		return true
 	}
-	currentHour := int64(clock.Now().Hour())
+	currentHour := int64(clock.Now().In(tz).Hour())
 	if startHour > endHour {
 		// handles the case when scheduler is configured to work during the night
 		// e.g. From 20:00 till 5:00
@@ -280,8 +289,24 @@ func (p *pir) ValidTime(clock clock.Clock) bool {
 }
 
 func (p *pir) UpdateSchedule(data map[string]int64) {
-	p.scheduleTo.value = int2Hour(data[p.scheduleTo.oid])
-	p.scheduleFrom.value = int2Hour(data[p.scheduleFrom.oid])
+	newFrom := int2Hour(data[p.scheduleFrom.oid])
+	newTo := int2Hour(data[p.scheduleTo.oid])
+
+	if p.scheduleFrom.value != newFrom {
+		log.Debug().
+			Str("pir", p.name).
+			Int64("from", newFrom).
+			Msg("updating the schedule")
+		p.scheduleFrom.value = newFrom
+	}
+
+	if p.scheduleTo.value != newTo {
+		log.Debug().
+			Str("pir", p.name).
+			Int64("to", newTo).
+			Msg("updating the schedule")
+		p.scheduleTo.value = newTo
+	}
 }
 
 // int2Hour returns hour value from the device
@@ -290,14 +315,32 @@ func int2Hour(i int64) int64 {
 }
 
 func main() {
+	zerolog.TimeFieldFormat = time.RFC3339
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 	snmpHost := flag.String("snmp-remote", "", "IP address of the snmp device")
 	snmpPort := flag.Uint("snmp-port", 161, "SNMP port of the device")
-	debug := flag.Bool("debug-debug", false, "Enable debug logging for the snmp library")
+	snmpVerbose := flag.Bool("snmp-verbose", false, "Enable verbose logging for the snmp library")
+	debug := flag.Bool("debug", false, "Enable debug logging for the app")
 	httpAddr := flag.String("addr", "127.0.0.1:8000", "Address and port to serve metrics on")
+	timeZone := flag.String("tz", "Europe/Kiev", "Time zone to use")
 	flag.Parse()
+	loc, err := time.LoadLocation(*timeZone)
+	if err != nil {
+		log.Fatal().Err(err).Str("tz", *timeZone).Msg("failed to parse time zone")
+	}
+	log.Info().
+		Time("local time", time.Now().In(loc)).
+		Str("version", Version).
+		Msg("Starting app")
+
+	// Default level for this example is info, unless debug flag is present
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	if *debug {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	}
+
 	if *snmpHost == "" {
-		fmt.Printf("`snmp-remote` is required")
-		os.Exit(1)
+		log.Fatal().Msg("`snmp-remote` is required")
 	}
 	c := &gosnmp.GoSNMP{
 		Port:               uint16(*snmpPort),
@@ -310,16 +353,18 @@ func main() {
 		ExponentialTimeout: true,
 		MaxOids:            gosnmp.MaxOids,
 	}
-	if *debug {
-		c.Logger = log.New(os.Stdout, "", 0)
+	if *snmpVerbose {
+		c.Logger = stdlog.New(os.Stdout, "", 0)
 	}
+	log.Info().Str("host", *snmpHost).Msg("connecting to the snmp host")
 	if err := c.Connect(); err != nil {
-		log.Fatalf("Connect() err: %v", err)
+		log.Fatal().Err(err).Msg("failed to Connect()")
 	}
 	cl := clock.NewRealClock()
 	a := &app{
 		snmp:         c,
 		clock:        cl,
+		tz:           loc,
 		tickInterval: time.Millisecond * 300,
 		pirs: map[string]*pir{
 			"first":  NewPir("first", pirAStateOid, pirAModeOid, relayAOid, relayAEnabledFromOid, relayAEnabledToOid),
@@ -327,8 +372,22 @@ func main() {
 		},
 		timeoutOid: pirTimeout,
 	}
+	log.Info().Msg("initializing the app state from the remote")
 	if err := a.updateState(); err != nil {
-		log.Fatalf("failed to get initial relayState: %v\n", err)
+		log.Fatal().Err(err).Msg("failed to get initial relayState")
+	}
+	log.Info().Msg("State populated")
+	for _, pir := range a.pirs {
+		log.Info().
+			Str("pir", pir.name).
+			Dur("timeout", pir.timeout).
+			Int64("enabled", pir.enabled.value).
+			Int64("relay", pir.relay.value).
+			Time("turnedOn", pir.turnedOn).
+			Time("lastChange", pir.lastChange).
+			Int64("scheduleFrom", pir.scheduleFrom.value).
+			Int64("scheduleTo", pir.scheduleTo.value).
+			Msg("pir state")
 	}
 
 	var wg sync.WaitGroup
@@ -344,7 +403,7 @@ func main() {
 		})
 		err := server.ListenAndServe()
 		if err != nil {
-			log.Fatalf("failed to start metrics server %v\n", err)
+			log.Fatal().Err(err).Msg("failed to ListenAndServe metrics server")
 		}
 		wg.Done()
 	}()
@@ -360,10 +419,10 @@ func main() {
 		for {
 			select {
 			case <-done:
-				fmt.Println("got termination signal")
+				log.Info().Msg("got termination signal")
 				err := server.Shutdown(context.Background())
 				if err != nil {
-					fmt.Printf("failed to shutdown metrics server %v\n", err)
+					log.Fatal().Err(err).Msg("failed to shutdown metrics server")
 				}
 				wg.Done()
 				return
