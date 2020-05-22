@@ -43,7 +43,7 @@ const (
 
 func main() {
 	zerolog.TimeFieldFormat = time.RFC3339
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
 	snmpHost := flag.String("snmp-remote", "", "IP address of the snmp device")
 	snmpPort := flag.Uint("snmp-port", 161, "SNMP port of the device")
 	snmpVerbose := flag.Bool("snmp-verbose", false, "Enable verbose logging for the snmp library")
@@ -61,7 +61,6 @@ func main() {
 		Time("local time", time.Now().In(loc)).
 		Str("version", Version).
 		Msg("Starting app")
-
 	// Default level for this example is info, unless debug flag is present
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	if *debug {
@@ -91,10 +90,10 @@ func main() {
 	}
 	cl := clock.NewRealClock()
 	a := &state.App{
-		Snmp:         c,
-		Clock:        cl,
-		TZ:           loc,
-		Sunriser:     sunrise.NewRealSunriser(cl, loc, *lat, *lon),
+		Snmp:     c,
+		Clock:    cl,
+		TZ:       loc,
+		Sunriser: sunrise.NewRealSunriser(cl, loc, *lat, *lon),
 		Pirs: map[string]*state.Pir{
 			"first":  state.NewPir("first", pirAStateOid, pirAModeOid, relayAOid, false),
 			"second": state.NewPir("second", pirBStateOid, pirBModeOid, relayBOid, true),
@@ -137,7 +136,7 @@ func main() {
 
 	wg.Add(1)
 	go func() {
-		a.ScheduleBackgroundUpdater(done, time.Millisecond * 300)
+		a.ScheduleBackgroundUpdater(done, time.Millisecond*300)
 		wg.Done()
 	}()
 

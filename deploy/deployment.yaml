@@ -18,7 +18,7 @@ spec:
     spec:
       containers:
       - name: lights
-        image: lwolf/tcw122b:13-443f6a1
+        image: lwolf/tcw122b:${VERSION}
         imagePullPolicy: IfNotPresent
         command:
           - /usr/bin/lights

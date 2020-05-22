@@ -17,3 +17,7 @@ docker-build: build test
 # Push the docker image
 docker-push:
 	docker push ${IMG}
+
+.PHONY: deploy
+deploy:
+	VERSION=${VERSION} envsubst < deploy/deployment.yaml | kubectl apply -f -
