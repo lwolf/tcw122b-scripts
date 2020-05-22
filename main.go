@@ -94,8 +94,7 @@ func main() {
 		Snmp:         c,
 		Clock:        cl,
 		TZ:           loc,
-		Sunriser:     sunrise.NewRealSunriser(cl, *loc, *lat, *lon),
-		TickInterval: time.Millisecond * 300,
+		Sunriser:     sunrise.NewRealSunriser(cl, loc, *lat, *lon),
 		Pirs: map[string]*state.Pir{
 			"first":  state.NewPir("first", pirAStateOid, pirAModeOid, relayAOid, false),
 			"second": state.NewPir("second", pirBStateOid, pirBModeOid, relayBOid, true),
@@ -138,7 +137,7 @@ func main() {
 
 	wg.Add(1)
 	go func() {
-		a.ScheduleBackgroundUpdater(done)
+		a.ScheduleBackgroundUpdater(done, time.Millisecond * 300)
 		wg.Done()
 	}()
 

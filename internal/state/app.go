@@ -37,7 +37,6 @@ type App struct {
 	Snmp snmp.GetterSetter
 
 	Clock        clock.Clock
-	TickInterval time.Duration
 	TZ           *time.Location
 
 	Sunriser sunrise.Sunriser
@@ -111,8 +110,8 @@ func (a *App) setRelayState(oid string, newState relayState) error {
 	return nil
 }
 
-func (a *App) ScheduleBackgroundUpdater(doneCh <-chan os.Signal) {
-	ticker := a.Clock.NewTicker(a.TickInterval)
+func (a *App) ScheduleBackgroundUpdater(doneCh <-chan os.Signal, tickInterval time.Duration) {
+	ticker := a.Clock.NewTicker(tickInterval)
 	for {
 		select {
 		case <-doneCh:
@@ -218,16 +217,13 @@ func (a *App) ValidTime() bool {
 func (a *App) UpdateSchedule() {
 	today := a.Clock.Now().Format("2006-01-02")
 	if a.SunsetUpdateDate != today || a.SunsetTime.IsZero() || a.SunriseTime.IsZero() {
-		srise, sset, err := a.Sunriser.GetSunriseSunset()
-		if err != nil {
-			log.Error().Err(err).Msg("failed to update SunriseTime data")
-		}
-		a.SunriseTime = srise
-		a.SunsetTime = sset
+		rise, set := a.Sunriser.GetSunriseSunset()
+		a.SunriseTime = rise
+		a.SunsetTime = set
 		a.SunsetUpdateDate = today
 		log.Debug().
-			Time("sunrise", srise).
-			Time("sunset", sset).
+			Time("sunrise", rise).
+			Time("sunset", set).
 			Str("updateDate", today).
 			Msg("Schedule updated")
 	}

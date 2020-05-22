@@ -18,14 +18,10 @@ type FakeSunriser struct {
 	tz      time.Location
 	sunrise time.Time
 	sunset  time.Time
-	err     error
 }
 
-func (fs *FakeSunriser) GetSunriseSunset() (time.Time, time.Time, error) {
-	if fs.err != nil {
-		return time.Time{}, time.Time{}, fs.err
-	}
-	return fs.sunrise, fs.sunset, nil
+func (fs *FakeSunriser) GetSunriseSunset() (time.Time, time.Time) {
+	return fs.sunrise, fs.sunset
 }
 
 type mockedSnmp struct {
@@ -141,7 +137,7 @@ func createTestApp(t *testing.T, pirName string, initialState map[string]int64, 
 		Clock:      cl,
 		TZ:         time.UTC,
 		TimeoutOid: fakeTimeoutOid,
-		Sunriser:   &FakeSunriser{cl, *time.UTC, sunrise, sunset, nil},
+		Sunriser:   &FakeSunriser{cl, *time.UTC, sunrise, sunset},
 		Pirs: map[string]*state.Pir{pirName: state.NewPir(
 			pirName,
 			fakeStateOid,
@@ -172,7 +168,7 @@ func TestNonInteractiveSwitch(t *testing.T) {
 		Snmp:       NewMockedSnmp(initialState),
 		Clock:      fc,
 		TZ:         time.UTC,
-		Sunriser:   &FakeSunriser{fc, *time.UTC, defaultSunrise, defaultSunset, nil},
+		Sunriser:   &FakeSunriser{fc, *time.UTC, defaultSunrise, defaultSunset},
 		TimeoutOid: fakeTimeoutOid,
 		Pirs:       map[string]*state.Pir{pirName: testPir},
 	}
